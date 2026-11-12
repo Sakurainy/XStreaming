@@ -1,0 +1,95 @@
+
+name: Build XStreaming iOS IPA
+
+on:
+  push:
+    branches:
+      - ios
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      # 1. 获取 ios 分支源代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 安装 Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: yarn.lock
+
+      # 3. 启用指定版本 Yarn
+      - name: Setup Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@4.2.2 --activate
+          yarn --version
+
+      # 4. 安装 JavaScript 依赖
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      # 5. 生成 iOS JavaScript Bundle
+      - name: Bundle React Native
+        run: yarn bundle:ios
+
+      # 6. 安装 CocoaPods
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install --deployment
+
+      # 7. 检查 Xcode 环境
+      - name: Check Xcode
+        run: |
+          xcodebuild -version
+          xcodebuild -list \
+            -workspace ios/XStreaming.xcworkspace
+
+      # 8. 编译 iOS Release
+      - name: Build iOS
+        run: |
+          xcodebuild \
+            -workspace ios/XStreaming.xcworkspace \
+            -scheme XStreaming \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      # 9. 打包成 IPA
+      - name: Package IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/XStreaming.app"
+
+          test -d "$APP_PATH"
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/"
+
+          cd "$RUNNER_TEMP/ipa"
+
+          zip -qry "$GITHUB_WORKSPACE/XStreaming-unsigned.ipa" Payload
+
+      # 10. 上传 IPA 编译产物
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: XStreaming-unsigned-IPA
+          path: XStreaming-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
