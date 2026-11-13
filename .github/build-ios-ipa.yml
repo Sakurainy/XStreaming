@@ -1,0 +1,196 @@
+name: Build iOS IPA (sideload)
+
+# 用途：在 GitHub 的 macOS runner 上把 Geocld/XStreaming 的 ios 分支编译成
+# 未签名 ipa，供 Sideloadly / AltStore / SideStore 等工具重签后侧载到 iPhone。
+#
+# 重要：workflow_dispatch 只有在「默认分支（main）」上存在本文件时才会出现在
+# Actions 页面。所以请把本文件提交到 fork 的 main 分支，然后在手动运行时
+# 把 ref 填成 ios（编译时 checkout 的是 ios 分支的代码）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '要编译的分支'
+        required: false
+        default: 'ios'
+      release:
+        description: '构建完成后创建 GitHub Release（artifacts 会过期，Release 长期保留，推荐勾选）'
+        type: boolean
+        default: true
+  push:
+    branches: [ios]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'images/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCHEME: XStreaming
+  WORKSPACE: ios/XStreaming.xcworkspace
+  BUNDLE_ID: com.geocld.XStreaming
+  APP_PATH: build/DerivedData/Build/Products/Release-iphoneos/XStreaming.app
+  IPA_NAME: XStreaming-unsigned.ipa
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'ios' }}
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          echo "commit: $(git rev-parse --short HEAD)  branch: $(git rev-parse --abbrev-ref HEAD)"
+          ls -d ios/*.xcodeproj ios/*.xcworkspace 2>/dev/null || true
+          xcodebuild -version
+          sw_vers
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Activate Yarn 4.2.2
+        run: |
+          corepack enable
+          corepack prepare yarn@4.2.2 --activate
+          yarn --version
+          node --version
+
+      - name: Install JS dependencies
+        env:
+          YARN_ENABLE_IMMUTABLE_INSTALLS: 'false'
+          YARN_ENABLE_GLOBAL_CACHE: 'true'
+        run: |
+          for i in 1 2 3; do
+            if yarn install; then echo "yarn install ok"; break; fi
+            echo "yarn install failed (attempt $i), retrying in 15s"; sleep 15
+          done
+          test -d node_modules || { echo "node_modules missing"; exit 1; }
+
+      - name: Bundle JS for Release
+        run: |
+          mkdir -p ios/bundle
+          yarn bundle:ios
+          ls -lh ios/bundle/main.jsbundle
+
+      - name: Pod install
+        run: |
+          if ! command -v pod >/dev/null 2>&1; then
+            sudo gem install cocoapods -v 1.16.2 --no-document
+          fi
+          pod --version
+          cd ios
+          pod install --verbose | tail -n 40
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -quiet \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP="$APP_PATH"
+          if [ ! -d "$APP" ]; then
+            echo "!! 未找到编译产物，列出可能的 .app："
+            find build -name "*.app" -maxdepth 8 -type d || true
+            exit 1
+          fi
+
+          echo "=== 产物信息 ==="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
+          lipo -info "$APP/$SCHEME" || true
+
+          # 清掉可能残留的签名信息，保证是干净的未签名包（重签工具会自己签）
+          rm -rf "$APP/_CodeSignature" "$APP/embedded.mobileprovision" "$APP/SC_Info"
+
+          rm -rf build/ipa
+          mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa
+          /usr/bin/zip -qry "$IPA_NAME" Payload
+          test -s "$IPA_NAME"
+          echo "=== ipa ==="
+          ls -lh "$IPA_NAME"
+          shasum -a 256 "$IPA_NAME" | tee "$IPA_NAME".sha256
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XStreaming-unsigned-ipa
+          path: |
+            build/ipa/XStreaming-unsigned.ipa
+            build/ipa/XStreaming-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish Release
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA
+        uses: actions/download-artifact@v4
+        with:
+          name: XStreaming-unsigned-ipa
+          path: dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="ios-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" dist/XStreaming-unsigned.ipa dist/XStreaming-unsigned.ipa.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "XStreaming iOS 侧载包 ${TAG}" \
+            --notes "未签名 ipa，需用 Sideloadly / AltStore / SideStore 重签后安装。安装后请在 设置 → 通用 → VPN 与设备管理 中信任证书。免费 Apple ID 签名有效期为 7 天。"
+          echo "release: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 可选：如果你想直接在 CI 里签好名（需要付费开发者账号 + 证书），把下面这段
+# 作为一个额外 job 加进去，并在仓库 Settings → Secrets 里配置：
+#   BUILD_CERTIFICATE_BASE64  导出为 .p12 后 base64 编码
+#   P12_PASSWORD              p12 密码
+#   BUILD_PROVISION_PROFILE_BASE64   .mobileprovision 的 base64
+#   KEYCHAIN_PASSWORD         随便设一个临时密码
+#   TEAM_ID                   你的 10 位 Team ID
+# 然后在 xcodebuild 里把 CODE_SIGNING_ALLOWED=NO 换成：
+#   CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$TEAM_ID" \
+#   PROVISIONING_PROFILE_SPECIFIER="<profile 名称>" CODE_SIGN_IDENTITY="Apple Distribution"
+# 注意：免费 Apple ID 无法自动化签名（需要 2FA），所以免费方案只能走未签名 + 本地重签。
+# ─────────────────────────────────────────────────────────────────────────────
+#（注：内容由AI生成）
